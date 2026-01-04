@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/jezek/xgb v1.2.0
 	github.com/natefinch/npipe v0.0.0-20160621034901-c1b8fa8bdcce
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
 )
