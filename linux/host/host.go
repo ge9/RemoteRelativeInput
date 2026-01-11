@@ -3,6 +3,7 @@ package host
 import (
 	"bufio"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -11,59 +12,26 @@ import (
 
 	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
-	"github.com/jezek/xgb/xtest"
 )
 
+const MODIF_AUTO_RELEASE = 0x100000
+
+type keyinfo struct {
+	kc    xproto.Keycode
+	modif uint32
+}
+
 func StartServer() {
-	//var xdot = linuxapi.NewXdotool(display)
-	scanner := bufio.NewScanner(os.Stdin)
-
-	X, _ := xgb.NewConn() //use DISPLAY and XAUTHORITY env
-	setup := xproto.Setup(X)
-
-	min := setup.MinKeycode
-	max := setup.MaxKeycode
-	//works for "core keyboard device" ? (xkbcomp without "-i")
-	reply, _ := xproto.GetKeyboardMapping(
-		X,
-		min,
-		byte(max-min+1),
-	).Reply()
-	keysymsPerKeycode := int(reply.KeysymsPerKeycode)
-
-	// for kc := min; kc < max; kc++ {
-	// 	base := int(kc-min) * keysymsPerKeycode
-	// 	for i := 0; i < keysymsPerKeycode; i++ {
-	// 		println(reply.Keysyms[base+i], kc)
-	// 	}
-	// }
-	result := make(map[uint8]xproto.Keycode)
-	//FIXME: hard-coded range from windows_key_map.go
-	for winKC := uint8(0x01); winKC <= 0xFE; winKC++ {
-		key, e := keymap.GetWindowsKeyDetail(uint32(winKC))
-		if e != nil {
-			continue
-		}
-		keysym, ok := keymap.X11Keys[key.EventInput]
-		if !ok {
-			continue
-		}
-
-		for kc := min; kc < max; kc++ {
-			base := int(kc-min) * keysymsPerKeycode
-			for i := 0; i < keysymsPerKeycode; i++ {
-				if keysym == 0xee01 { //customized keys, OEM_102. FIXME: This code is Japan-centric and also assume default xkb mapping.
-					result[winKC] = 132
-				} else if uint32(reply.Keysyms[base+i]) == keysym {
-					result[winKC] = kc
-					goto found
-				}
-			}
-		}
-	found:
+	X, _ := xgb.NewConn() //use DISPLAY and XAUTHORITY env. This is also used in Wayland (for xkb).
+	result := getKeyMap(X)
+	id := func(x int) int {
+		return x
 	}
-
-	xtest.Init(X)
+	fi := NewFakeInput(X, id)
+	scanner := bufio.NewScanner(os.Stdin)
+	mbm := MouseButtonMap{
+		1, 2, 4, 8, 16,
+	}
 	for scanner.Scan() {
 		if scanner.Text() == "CLOSE" {
 			os.Exit(0)
@@ -95,55 +63,103 @@ func StartServer() {
 		case keymap.EV_TYPE_MOUSE_MOVE:
 			switch uint32(eventInput) {
 			case uint32(remote_send.MouseMoveTypeRelative):
-				xtest.FakeInput(X, xproto.MotionNotify, 1, 0, 0, int16(eventValue1), int16(eventValue2), 0) //1 = True = Relative
+				fi.MouseMoveRel(int16(eventValue1), int16(eventValue2))
 			case uint32(remote_send.MouseMoveTypeAbsolute):
-				xtest.FakeInput(X, xproto.MotionNotify, 0, 0, 0, int16(eventValue1), int16(eventValue2), 0) //0 = False = Positive. TODO: test this code
+				fi.MouseMoveAbs(int16(eventValue1), int16(eventValue2))
 			}
 		case keymap.EV_TYPE_MOUSE:
-			var button byte
-			switch eventInput {
-			case 0x01:
-				button = 1 // Left
-			case 0x04:
-				button = 2 // Middle
-			case 0x02:
-				button = 3 // Right
-			default:
-				continue
-			}
-
-			switch uint32(eventValue1) {
-			case uint32(remote_send.KeyDown):
-				xtest.FakeInput(X, xproto.ButtonPress, button, 0, 0, 0, 0, 0)
-			case uint32(remote_send.KeyUp):
-				xtest.FakeInput(X, xproto.ButtonRelease, button, 0, 0, 0, 0, 0)
-			}
+			fi.MouseButtonMapped(uint8(eventInput), mbm, int(eventValue1))
 		case keymap.EV_TYPE_WHEEL:
-			switch uint32(eventValue1) {
-			case uint32(remote_send.KeyDown):
-				// down = button 5
-				xtest.FakeInput(X, xproto.ButtonPress, 5, 0, 0, 0, 0, 0)
-				xtest.FakeInput(X, xproto.ButtonRelease, 5, 0, 0, 0, 0, 0)
-			case uint32(remote_send.KeyUp):
-				// up = button 4
-				xtest.FakeInput(X, xproto.ButtonPress, 4, 0, 0, 0, 0, 0)
-				xtest.FakeInput(X, xproto.ButtonRelease, 4, 0, 0, 0, 0, 0)
+			if eventValue1 == 1 {
+				eventInput = -eventInput
 			}
+			fi.Wheel(int(eventInput))
 		case keymap.EV_TYPE_KEY:
-			key, err := keymap.GetWindowsKeyDetail(uint32(eventInput))
-			if err != nil || key.EventInput == "" {
+			ki := result[uint8(eventInput)]
+			if ki.kc == 0 {
 				println("unsupported key:", uint32(eventInput))
 				continue
 			}
-
 			switch uint32(eventValue1) {
 			case uint32(remote_send.KeyDown):
-				//xdot.KeyDown(key.EventInput)
-				xtest.FakeInput(X, xproto.KeyPress, byte(result[uint8(eventInput)]), 0, 0, 0, 0, 0)
+				println(eventInput)
+				println(ki.kc)
+				fi.KeyDown(ki)
 			case uint32(remote_send.KeyUp):
-				//xdot.KeyUp(key.EventInput)
-				xtest.FakeInput(X, xproto.KeyRelease, byte(result[uint8(eventInput)]), 0, 0, 0, 0, 0)
+				fi.KeyUp(ki)
 			}
 		}
 	}
+}
+
+func getKeyMap(X *xgb.Conn) map[uint8]keyinfo {
+	setup := xproto.Setup(X)
+	min := setup.MinKeycode
+	max := setup.MaxKeycode
+	//works for "core keyboard device" ? (xkbcomp without "-i")
+	reply, _ := xproto.GetKeyboardMapping(
+		X,
+		min,
+		byte(max-min+1),
+	).Reply()
+	keysymsPerKeycode := int(reply.KeysymsPerKeycode)
+
+	shiftOnlyKeys := []uint32{0x007c}   //fix for OEM_102 (bar/underscore) in jp106, ignore AltGr keys
+	autoReleaseKeys := []uint32{0xff2a} //fix for Zenkaku_Hankaku in jp106
+	keymap_override := map[uint8]uint32{0xDE: 0x005e}
+
+	for kc := min; kc < max; kc++ {
+		base := int(kc-min) * keysymsPerKeycode
+		for i := 0; i < keysymsPerKeycode; i++ { //i=0, 1, 2, 3 is (typically) for none, Shift, AltGr, Shift+AltGr
+			println(reply.Keysyms[base+i], kc, i)
+		}
+	}
+	result := make(map[uint8]keyinfo)
+	for winKC := uint8(0x01); winKC <= 0xFE; winKC++ {
+		key, e := keymap.GetWindowsKeyDetail(uint32(winKC))
+		keysym := keymap_override[winKC]
+		if keysym == 0 { //use default
+			if e != nil {
+				continue
+			}
+			keysym0, ok := keymap.X11Keys[key.Constant]
+			if !ok {
+				continue
+			}
+			keysym = keysym0
+		}
+
+		for kc := min; kc < max; kc++ {
+			base := int(kc-min) * keysymsPerKeycode
+			for i := 0; i < keysymsPerKeycode; i++ {
+				if slices.Contains(shiftOnlyKeys, keysym) && i >= 2 {
+					continue
+				}
+				if uint32(reply.Keysyms[base+i]) == keysym {
+					//hotkeys
+					switch key.Constant {
+					case "VK_CONTROL":
+						result[winKC] = keyinfo{kc, 4}
+					case "VK_CAPITAL":
+						result[winKC] = keyinfo{kc, 2}
+					case "VK_SHIFT":
+						result[winKC] = keyinfo{kc, 1}
+					case "VK_MENU":
+						result[winKC] = keyinfo{kc, 8}
+					case "VK_NUMLOCK":
+						result[winKC] = keyinfo{kc, 16}
+					default:
+						result[winKC] = keyinfo{kc, 0}
+						//this is a bit hacky but we use modifier variable also as a mark for "auto-release" keys
+						if slices.Contains(autoReleaseKeys, keysym) {
+							result[winKC] = keyinfo{kc, MODIF_AUTO_RELEASE}
+						}
+					}
+					goto found
+				}
+			}
+		}
+	found:
+	}
+	return result
 }

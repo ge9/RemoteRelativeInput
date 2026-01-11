@@ -7,10 +7,11 @@ require (
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
 	github.com/moutend/go-wca v0.2.0
 	github.com/pkg/errors v0.9.1
-	golang.org/x/sys v0.2.0
+	golang.org/x/sys v0.29.0
 )
 
 require (
+	github.com/MatthiasKunnen/go-wayland/wayland v0.2.0
 	github.com/jezek/xgb v1.2.0
 	github.com/natefinch/npipe v0.0.0-20160621034901-c1b8fa8bdcce
 	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce // indirect
