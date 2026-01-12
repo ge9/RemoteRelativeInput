@@ -2,14 +2,20 @@ package client
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"syscall"
+	"unsafe"
 
 	"github.com/TKMAX777/RemoteRelativeInput/debug"
 	"github.com/TKMAX777/RemoteRelativeInput/keymap"
 	"github.com/TKMAX777/RemoteRelativeInput/remote_send"
 	"github.com/TKMAX777/RemoteRelativeInput/winapi"
 	"github.com/lxn/win"
+)
+
+var (
+	imm32                   = syscall.NewLazyDLL("imm32.dll")
+	procImmAssociateContext = imm32.NewProc("ImmAssociateContext")
 )
 
 func (h Handler) getWindowProc(rdClientHwnd win.HWND) func(hwnd win.HWND, uMsg uint32, wParam uintptr, lParam uintptr) uintptr {
@@ -25,6 +31,7 @@ func (h Handler) getWindowProc(rdClientHwnd win.HWND) func(hwnd win.HWND, uMsg u
 	var windowCenterPosition = h.getWindowCenterPos(rect)
 
 	var currentPosition = windowCenterPosition
+	var _ = currentPosition
 	debug.Debugln("ToggleKey: ", h.options.toggleKey)
 	debug.Debugln("ToggleType: ", h.options.toggleType)
 	debug.Debugln("ExitKey: ", h.options.exitKey)
@@ -96,7 +103,11 @@ func (h Handler) getWindowProc(rdClientHwnd win.HWND) func(hwnd win.HWND, uMsg u
 			winapi.SetLayeredWindowAttributes(hwnd, 0x0000FF, byte(1), winapi.LWA_COLORKEY)
 			h.initWindowAndCursor(hwnd, rdClientHwnd)
 			win.UpdateWindow(hwnd)
+			registerRawInput(hwnd)
+			procImmAssociateContext.Call(uintptr(hwnd), 0) //avoid invoking IME
 
+			return winapi.NULL
+		case win.WM_SETFOCUS:
 			return winapi.NULL
 		case win.WM_DESTROY:
 			h.remote.SendExit()
@@ -129,64 +140,103 @@ func (h Handler) getWindowProc(rdClientHwnd win.HWND) func(hwnd win.HWND, uMsg u
 			h.remote.SendExit()
 			os.Exit(0)
 			return winapi.NULL
-		case win.WM_MOUSEMOVE:
-			if isRelativeMode {
-				ok := winapi.GetCursorPos(&currentPosition)
-				if !ok {
-					log.Printf("Error in get cursor position\n")
-				}
-				// Relative position mode
-				var point = win.POINT{X: currentPosition.X - windowCenterPosition.X, Y: currentPosition.Y - windowCenterPosition.Y}
-				if point.X != 0 || point.Y != 0 {
-					debug.Debugf("X: %4d Y: %4d\n", point.X, point.Y)
-					h.remote.SendRelativeCursor(point.X, point.Y)
+		case win.WM_INPUT:
 
-					ok = win.SetCursorPos(windowCenterPosition.X, windowCenterPosition.Y)
-					if !ok {
-						log.Printf("Error in set cursor position")
+			var size uint32
+			win.GetRawInputData(
+				win.HRAWINPUT(lParam),
+				win.RID_INPUT,
+				nil,
+				&size,
+				uint32(unsafe.Sizeof(win.RAWINPUTHEADER{})),
+			)
+
+			buf := make([]byte, size)
+			if win.GetRawInputData(
+				win.HRAWINPUT(lParam),
+				win.RID_INPUT,
+				unsafe.Pointer(&buf[0]),
+				&size,
+				uint32(unsafe.Sizeof(win.RAWINPUTHEADER{})),
+			) != size {
+				return winapi.NULL
+			}
+
+			hdr := (*win.RAWINPUTHEADER)(unsafe.Pointer(&buf[0]))
+
+			switch hdr.DwType {
+
+			case win.RIM_TYPEMOUSE:
+				raw := (*win.RAWINPUTMOUSE)(unsafe.Pointer(&buf[0]))
+				m := raw.Data
+
+				if isRelativeMode {
+					dx := int32(m.LLastX)
+					dy := int32(m.LLastY)
+
+					if dx != 0 || dy != 0 {
+						h.remote.SendRelativeCursor(dx, dy)
+					}
+
+					btn := m.UsButtonData
+					if btn&win.RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x01, remote_send.KeyDown)
+					}
+					if btn&win.RI_MOUSE_LEFT_BUTTON_UP != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x01, remote_send.KeyUp)
+					}
+					if btn&win.RI_MOUSE_RIGHT_BUTTON_DOWN != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x02, remote_send.KeyDown)
+					}
+					if btn&win.RI_MOUSE_RIGHT_BUTTON_UP != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x02, remote_send.KeyUp)
+					}
+					if btn&win.RI_MOUSE_MIDDLE_BUTTON_DOWN != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x04, remote_send.KeyDown)
+					}
+					if btn&win.RI_MOUSE_MIDDLE_BUTTON_UP != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x04, remote_send.KeyUp)
+					}
+					if btn&win.RI_MOUSE_BUTTON_4_DOWN != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x08, remote_send.KeyDown)
+					}
+					if btn&win.RI_MOUSE_BUTTON_4_UP != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x08, remote_send.KeyUp)
+					}
+					if btn&win.RI_MOUSE_BUTTON_5_DOWN != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x10, remote_send.KeyDown)
+					}
+					if btn&win.RI_MOUSE_BUTTON_5_UP != 0 {
+						send(keymap.EV_TYPE_MOUSE, 0x10, remote_send.KeyUp)
+					}
+
+					if btn&win.RI_MOUSE_WHEEL != 0 {
+						//we have to use ugly Pad_cgo_* fields here...
+						delta := uint16(m.Pad_cgo_0[0]) | uint16(m.Pad_cgo_0[1])<<8
+						wheel := int16(delta)
+						if wheel > 0 {
+							send(keymap.EV_TYPE_WHEEL, uint32(wheel), remote_send.KeyUp)
+						} else {
+							send(keymap.EV_TYPE_WHEEL, uint32(-wheel), remote_send.KeyDown)
+						}
 					}
 				}
+
+			case win.RIM_TYPEKEYBOARD:
+				_ = fmt.Errorf("e%v", 4)
+
+				raw := (*win.RAWINPUTKEYBOARD)(unsafe.Pointer(&buf[0]))
+				k := raw.Data
+
+				key := uint32(k.VKey)
+
+				if k.Flags&win.RI_KEY_BREAK != 0 {
+					send(keymap.EV_TYPE_KEY, key, remote_send.KeyUp)
+				} else {
+					send(keymap.EV_TYPE_KEY, key, remote_send.KeyDown)
+				}
 			}
 
-			return winapi.NULL
-		case win.WM_SYSKEYDOWN:
-			if lParam>>30&1 == 0 {
-				send(keymap.EV_TYPE_KEY, uint32(wParam), remote_send.KeyDown)
-			}
-			return winapi.NULL
-		case win.WM_SYSKEYUP:
-			send(keymap.EV_TYPE_KEY, uint32(wParam), remote_send.KeyUp)
-			return winapi.NULL
-		case win.WM_KEYDOWN:
-			send(keymap.EV_TYPE_KEY, uint32(wParam), remote_send.KeyDown)
-			return winapi.NULL
-		case win.WM_KEYUP:
-			send(keymap.EV_TYPE_KEY, uint32(wParam), remote_send.KeyUp)
-			return winapi.NULL
-		case win.WM_MOUSEWHEEL:
-			if int16(wParam>>16) > 0 {
-				send(keymap.EV_TYPE_WHEEL, uint32(int16(wParam>>16)), remote_send.KeyUp)
-			} else {
-				send(keymap.EV_TYPE_WHEEL, uint32(int16(wParam>>16)), remote_send.KeyDown)
-			}
-			return winapi.NULL
-		case win.WM_LBUTTONUP:
-			send(keymap.EV_TYPE_MOUSE, 0x01, remote_send.KeyUp)
-			return winapi.NULL
-		case win.WM_LBUTTONDOWN:
-			send(keymap.EV_TYPE_MOUSE, 0x01, remote_send.KeyDown)
-			return winapi.NULL
-		case win.WM_RBUTTONUP:
-			send(keymap.EV_TYPE_MOUSE, 0x02, remote_send.KeyUp)
-			return winapi.NULL
-		case win.WM_RBUTTONDOWN:
-			send(keymap.EV_TYPE_MOUSE, 0x02, remote_send.KeyDown)
-			return winapi.NULL
-		case win.WM_MBUTTONUP:
-			send(keymap.EV_TYPE_MOUSE, 0x04, remote_send.KeyUp)
-			return winapi.NULL
-		case win.WM_MBUTTONDOWN:
-			send(keymap.EV_TYPE_MOUSE, 0x04, remote_send.KeyDown)
 			return winapi.NULL
 		default:
 			return win.DefWindowProc(hwnd, uMsg, wParam, lParam)
@@ -197,4 +247,29 @@ func (h Handler) getWindowProc(rdClientHwnd win.HWND) func(hwnd win.HWND, uMsg u
 func (h Handler) Close() {
 	winapi.ClipCursor(nil)
 	winapi.ShowCursor(true)
+}
+
+func registerRawInput(hwnd win.HWND) error {
+	rids := []win.RAWINPUTDEVICE{
+		{
+			UsUsagePage: 0x01, // Generic Desktop
+			UsUsage:     0x02, // Mouse
+			DwFlags:     win.RIDEV_INPUTSINK,
+			HwndTarget:  hwnd,
+		},
+		{
+			UsUsagePage: 0x01, // Generic Desktop
+			UsUsage:     0x06, // Keyboard
+			DwFlags:     win.RIDEV_INPUTSINK,
+			HwndTarget:  hwnd,
+		},
+	}
+	if !win.RegisterRawInputDevices(
+		&rids[0],
+		uint32(len(rids)),
+		uint32(unsafe.Sizeof(rids[0])),
+	) {
+		return fmt.Errorf("RegisterRawInputDevices failed")
+	}
+	return nil
 }
