@@ -2,7 +2,8 @@
 
 ## About This Program
 
-This program is designed to allow relative input in an RDP (VNC) session by wrapping an existing remote desktop client window with another window and sending the client's input information using an SSH session. Currently, only sessions from a Windows machine to a Windows or Linux machine are supported.
+This program is designed to allow relative input in an RDP (VNC) session by wrapping an existing remote desktop client window with another window and sending the client's input information via network (typically SSH). 
+Windows and Linux is supported (server side & client side), except for KDE and GNOME in server-side linux.
 
 ![sample](https://gyazo.com/5b6e57408136ba4fcebfd2525b7dc232.gif)
 
@@ -14,6 +15,8 @@ This program is easier to install and use.
 Check:
 [github.com/TKMAX777/RDPRelativeInput](https://github.com/TKMAX777/RDPRelativeInput)
 
+## TODO
+-  server-side support for GNOME Mutter (libei)
 ## install
 
 ### Server

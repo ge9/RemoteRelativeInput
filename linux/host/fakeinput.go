@@ -65,9 +65,9 @@ func (xfi XFakeInput) MouseButtonMapped(btn uint8, btnmap MouseButtonMap, isUp i
 	case uint8(btnmap.Middle):
 		button = 2
 	case uint8(btnmap.Forward):
-		button = 0 // todo
+		button = 9
 	case uint8(btnmap.Back):
-		button = 0 // todo
+		button = 8
 
 	default:
 		fmt.Printf("mouse button %d is not supported", btn)
@@ -209,10 +209,10 @@ func (wi *WaylandInput) MouseButtonMapped(btn uint8, btnmap MouseButtonMap, isUp
 }
 
 func (wi *WaylandInput) KeyDown(ki keyinfo) {
-	wi.keyboard.Key(0, uint32(ki.kc)-8, 1)
+	wi.keyboard.Key(0, ki.kc-8, 1)
 	if ki.modif == MODIF_AUTO_RELEASE {
-		wi.keyboard.Key(0, uint32(ki.kc)-8, 1)
-		wi.keyboard.Key(0, uint32(ki.kc)-8, 0)
+		wi.keyboard.Key(0, ki.kc-8, 1)
+		wi.keyboard.Key(0, ki.kc-8, 0)
 	} else if ki.modif != 0 {
 		wi.currentDepressed |= ki.modif
 		wi.keyboard.Modifiers(wi.currentDepressed, 0, 0, 0)
@@ -220,7 +220,7 @@ func (wi *WaylandInput) KeyDown(ki keyinfo) {
 }
 
 func (wi *WaylandInput) KeyUp(ki keyinfo) {
-	wi.keyboard.Key(0, uint32(ki.kc)-8, 0)
+	wi.keyboard.Key(0, ki.kc-8, 0)
 	if ki.modif != 0 {
 		wi.currentDepressed &^= ki.modif
 		wi.keyboard.Modifiers(wi.currentDepressed, 0, 0, 0)

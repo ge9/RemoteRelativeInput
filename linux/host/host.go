@@ -2,6 +2,8 @@ package host
 
 import (
 	"bufio"
+	"flag"
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
@@ -17,21 +19,52 @@ import (
 const MODIF_AUTO_RELEASE = 0x100000
 
 type keyinfo struct {
-	kc    xproto.Keycode
+	kc    uint32
 	modif uint32
 }
 
 func StartServer() {
 	X, _ := xgb.NewConn() //use DISPLAY and XAUTHORITY env. This is also used in Wayland (for xkb).
-	result := getKeyMap(X)
+
+	var (
+		clientLinux        bool
+		shiftOnlyFlag      string
+		autoReleaseFlag    string
+		keymapOverrideFlag string
+	)
+
+	flag.BoolVar(&clientLinux, "linux", false,
+		"the client is Linux")
+	flag.StringVar(&shiftOnlyFlag, "shiftonly", "",
+		"comma-separated uint32 keycodes (e.g. 0x007c,111)")
+	flag.StringVar(&autoReleaseFlag, "autorelease", "",
+		"comma-separated uint32 keycodes (e.g. 0xff2a,222)")
+	flag.StringVar(&keymapOverrideFlag, "keymap-override", "",
+		"comma-separated key mappings uint8:uint32 (e.g. 0xDE:0x005e,111:222)")
+
+	flag.Parse()
+	shiftOnlyKeys := parseUint32List(shiftOnlyFlag)
+	autoReleaseKeys := parseUint32List(autoReleaseFlag)
+	keymap_override := parseKeymapOverride(keymapOverrideFlag)
+
+	fmt.Printf("shiftOnlyKeys = %#v\n", shiftOnlyKeys)
+	fmt.Printf("autoReleaseKeys = %#v\n", autoReleaseKeys)
+	fmt.Printf("keymap_override = %#v\n", keymap_override)
+	mbm := MouseButtonMap{
+		1, 3, 2, 9, 8,
+	}
+	result := getKeyMapLinux(X, shiftOnlyKeys, keymap_override)
+	if !clientLinux { //Windows
+		result = getKeyMapWin(X, shiftOnlyKeys, autoReleaseKeys, keymap_override)
+		mbm = MouseButtonMap{
+			1, 2, 4, 8, 16,
+		}
+	}
 	id := func(x int) int {
 		return x
 	}
 	fi := NewFakeInput(X, id)
 	scanner := bufio.NewScanner(os.Stdin)
-	mbm := MouseButtonMap{
-		1, 2, 4, 8, 16,
-	}
 	for scanner.Scan() {
 		if scanner.Text() == "CLOSE" {
 			os.Exit(0)
@@ -82,8 +115,6 @@ func StartServer() {
 			}
 			switch uint32(eventValue1) {
 			case uint32(remote_send.KeyDown):
-				println(eventInput)
-				println(ki.kc)
 				fi.KeyDown(ki)
 			case uint32(remote_send.KeyUp):
 				fi.KeyUp(ki)
@@ -91,29 +122,40 @@ func StartServer() {
 		}
 	}
 }
-
-func getKeyMap(X *xgb.Conn) map[uint8]keyinfo {
+func getModifMap(X *xgb.Conn) map[uint32]uint32 {
+	modif_map := make(map[uint32]uint32)
+	reply2, _ := xproto.GetModifierMapping(
+		X,
+	).Reply()
+	kpm := int(reply2.KeycodesPerModifier)
+	for modIdx := 0; modIdx < 8; modIdx++ { //there are 8 modifiers. reference: "Key masks" in /usr/include/X11/X.h
+		base := modIdx * kpm
+		for i := 0; i < kpm; i++ {
+			kc := reply2.Keycodes[base+i]
+			if kc != 0 {
+				modif_map[uint32(kc)] = 1 << modIdx
+			}
+		}
+	}
+	return modif_map
+}
+func getKeyMapWin(X *xgb.Conn, shiftOnlyKeys []uint32, autoReleaseKeys []uint32, keymap_override map[uint8]uint32) map[uint8]keyinfo {
 	setup := xproto.Setup(X)
-	min := setup.MinKeycode
-	max := setup.MaxKeycode
+	min := uint32(setup.MinKeycode)
+	max := uint32(setup.MaxKeycode)
 	//works for "core keyboard device" ? (xkbcomp without "-i")
 	reply, _ := xproto.GetKeyboardMapping(
 		X,
-		min,
+		xproto.Keycode(min),
 		byte(max-min+1),
 	).Reply()
+
 	keysymsPerKeycode := int(reply.KeysymsPerKeycode)
+	modif_map := getModifMap(X)
+	// shiftOnlyKeys := []uint32{0x007c}   //fix for OEM_102 (bar/underscore) in jp106, ignore AltGr keys
+	// autoReleaseKeys := []uint32{0xff2a} //fix for Zenkaku_Hankaku in jp106
+	// keymap_override := map[uint8]uint32{0xDE: 0x005e}
 
-	shiftOnlyKeys := []uint32{0x007c}   //fix for OEM_102 (bar/underscore) in jp106, ignore AltGr keys
-	autoReleaseKeys := []uint32{0xff2a} //fix for Zenkaku_Hankaku in jp106
-	keymap_override := map[uint8]uint32{0xDE: 0x005e}
-
-	for kc := min; kc < max; kc++ {
-		base := int(kc-min) * keysymsPerKeycode
-		for i := 0; i < keysymsPerKeycode; i++ { //i=0, 1, 2, 3 is (typically) for none, Shift, AltGr, Shift+AltGr
-			println(reply.Keysyms[base+i], kc, i)
-		}
-	}
 	result := make(map[uint8]keyinfo)
 	for winKC := uint8(0x01); winKC <= 0xFE; winKC++ {
 		key, e := keymap.GetWindowsKeyDetail(uint32(winKC))
@@ -136,24 +178,11 @@ func getKeyMap(X *xgb.Conn) map[uint8]keyinfo {
 					continue
 				}
 				if uint32(reply.Keysyms[base+i]) == keysym {
-					//hotkeys
-					switch key.Constant {
-					case "VK_CONTROL":
-						result[winKC] = keyinfo{kc, 4}
-					case "VK_CAPITAL":
-						result[winKC] = keyinfo{kc, 2}
-					case "VK_SHIFT":
-						result[winKC] = keyinfo{kc, 1}
-					case "VK_MENU":
-						result[winKC] = keyinfo{kc, 8}
-					case "VK_NUMLOCK":
-						result[winKC] = keyinfo{kc, 16}
-					default:
-						result[winKC] = keyinfo{kc, 0}
-						//this is a bit hacky but we use modifier variable also as a mark for "auto-release" keys
-						if slices.Contains(autoReleaseKeys, keysym) {
-							result[winKC] = keyinfo{kc, MODIF_AUTO_RELEASE}
-						}
+					if slices.Contains(autoReleaseKeys, keysym) {
+						result[winKC] = keyinfo{kc, MODIF_AUTO_RELEASE}
+					} else {
+						modbit := modif_map[kc] //0 if not a modifier
+						result[winKC] = keyinfo{kc, modbit}
 					}
 					goto found
 				}
@@ -162,4 +191,68 @@ func getKeyMap(X *xgb.Conn) map[uint8]keyinfo {
 	found:
 	}
 	return result
+}
+
+// basically identity function
+func getKeyMapLinux(X *xgb.Conn, autoReleaseKeys []uint32, keymap_override map[uint8]uint32) map[uint8]keyinfo {
+	modif_map := getModifMap(X)
+	result := make(map[uint8]keyinfo)
+	for kc := uint8(1); kc < 0xFF; kc++ {
+		kc0 := uint32(kc)
+		kc1 := keymap_override[kc]
+		if kc1 != 0 {
+			kc0 = kc1
+		}
+		//this is a bit hacky but we use the modifier variable also for "auto-release" flag
+		if slices.Contains(autoReleaseKeys, kc0) {
+			result[kc] = keyinfo{kc0, MODIF_AUTO_RELEASE}
+		} else {
+			modbit := modif_map[kc0] //0 if not a modifier
+			result[kc] = keyinfo{kc0, modbit}
+		}
+	}
+	return result
+}
+
+func parseUint32List(s string) []uint32 {
+	var out []uint32
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(part, 0, 32)
+		if err != nil {
+			panic(fmt.Errorf("invalid uint32 value %q: %w", part, err))
+		}
+		out = append(out, uint32(v))
+	}
+	return out
+}
+func parseKeymapOverride(s string) map[uint8]uint32 {
+	out := make(map[uint8]uint32)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) != 2 {
+			panic(fmt.Errorf("invalid keymap override %q (expected a:b)", part))
+		}
+
+		k, err := strconv.ParseUint(kv[0], 0, 8)
+		if err != nil {
+			panic(fmt.Errorf("invalid key (uint8) %q: %w", kv[0], err))
+		}
+
+		v, err := strconv.ParseUint(kv[1], 0, 32)
+		if err != nil {
+			panic(fmt.Errorf("invalid value (uint32) %q: %w", kv[1], err))
+		}
+
+		out[uint8(k)] = uint32(v)
+	}
+	return out
 }
