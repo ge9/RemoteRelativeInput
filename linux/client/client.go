@@ -1,3 +1,4 @@
+// *This doesn't work in XWayland. Use C implementation instead.*
 package client
 
 import (
