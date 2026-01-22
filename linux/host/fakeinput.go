@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/MatthiasKunnen/go-wayland/wayland/client"
 	"github.com/TKMAX777/RemoteRelativeInput/gowayland"
+	"github.com/bnema/libei-go-bindings"
 	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
 	"github.com/jezek/xgb/xtest"
@@ -34,13 +36,21 @@ type MouseButtonMap struct {
 
 func NewFakeInput(X *xgb.Conn, f func(int) int) FakeInput {
 	wi, err := NewWaylandInput()
-	if err == nil {
-		println("wayland setup ok")
-		return wi
+	if err != nil {
+		println("seems not wayland, use X11")
+		xtest.Init(X)
+		println("X11 FakeInput setup ok")
+		return XFakeInput{X: X}
 	}
-	println("seems not wayland, use X11")
-	xtest.Init(X)
-	return XFakeInput{X: X}
+	err = wi.SetupWaylandInput()
+	if err != nil {
+		println("wayland but not wlroots, use libei")
+		oo, _ := NewLibeiInput()
+		println("libei FakeInput setup ok")
+		return oo
+	}
+	println("wlroots FakeInput setup ok")
+	return wi
 }
 
 //X11
@@ -105,18 +115,20 @@ type WaylandInput struct {
 func NewWaylandInput() (*WaylandInput, error) {
 	display, err := client.Connect("")
 	wi := &WaylandInput{display: display}
-	if err != nil {
-		return nil, err
-	}
-	wi.registry, _ = display.GetRegistry()
+	return wi, err
+}
+func (wi *WaylandInput) SetupWaylandInput() error {
+	wi.registry, _ = wi.display.GetRegistry()
 	wi.registry.SetGlobalHandler(wi.onGlobal)
-	display.Roundtrip()
-	display.Roundtrip()
+	wi.display.Roundtrip()
+	if wi.pointerManager == nil || wi.keyboardManager == nil { //TODO: we may need better error handling
+		return fmt.Errorf("maybe not wlroots")
+	}
 	wi.pointer, _ = wi.pointerManager.CreateVirtualPointer(wi.seat)
 	wi.keyboard, _ = wi.keyboardManager.CreateVirtualKeyboard(wi.seat)
-	display.Roundtrip()
+	wi.display.Roundtrip()
 	wi.SetupKeymapFromSystem()
-	return wi, nil
+	return nil
 }
 
 func (wi *WaylandInput) onGlobal(e client.RegistryGlobalEvent) {
@@ -235,4 +247,186 @@ func (wi *WaylandInput) Wheel(delta int) {
 	wi.pointer.AxisSource(0)
 	wi.pointer.AxisStop(0, 0)
 	wi.pointer.Frame()
+}
+
+// Wayland (GNOME Mutter)
+
+type LibEIInput struct {
+	client *libei.Context
+	//we need a map here maybe
+	devices map[libei.DeviceCapability]*libei.Device
+	session *EISSession
+	mu      sync.Mutex
+	ready   chan struct{}
+	once    sync.Once
+}
+
+func NewLibeiInput() (*LibEIInput, error) {
+	session, err := GetEISSession()
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := libei.NewSender(nil)
+	if err != nil {
+		session.Close()
+		return nil, err
+	}
+
+	if err := client.SetupFD(session.FD); err != nil {
+		session.Close()
+		return nil, err
+	}
+
+	impl := &LibEIInput{
+		client:  client,
+		session: session,
+		ready:   make(chan struct{}),
+	}
+
+	go impl.runEventLoop()
+
+	fmt.Println("Waiting for devices ready")
+	<-impl.ready
+	return impl, nil
+}
+
+func (f *LibEIInput) runEventLoop() {
+	f.devices = make(map[libei.DeviceCapability]*libei.Device)
+
+	for {
+		f.mu.Lock()
+		f.client.Dispatch()
+		ev, _ := f.client.GetEvent()
+		f.mu.Unlock()
+
+		if ev == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		switch ev.Type() {
+		case libei.EventSeatAdded:
+			f.mu.Lock()
+			ev.Seat().BindCapabilities(
+				libei.DeviceCapPointer,
+				libei.DeviceCapPointerAbsolute,
+				libei.DeviceCapKeyboard,
+				libei.DeviceCapButton,
+				libei.DeviceCapScroll,
+			)
+			f.mu.Unlock()
+
+		case libei.EventDeviceAdded:
+			f.mu.Lock()
+			dev := ev.Device()
+			dev.StartEmulating(0)
+
+			caps := []libei.DeviceCapability{
+				libei.DeviceCapPointer,
+				libei.DeviceCapKeyboard,
+				libei.DeviceCapButton,
+				libei.DeviceCapScroll,
+				libei.DeviceCapPointerAbsolute,
+			}
+			for _, c := range caps {
+				if dev.HasCapability(c) {
+					f.devices[c] = dev
+					fmt.Printf("Device registered ok: %s (Capability: %v)\n", dev.Name(), c)
+				}
+			}
+			f.mu.Unlock()
+
+			// treat as ready if at least one device is ready (is this OK...?)
+			f.once.Do(func() { close(f.ready) })
+		}
+		ev.Release()
+	}
+}
+
+func (f *LibEIInput) getDevice(cap libei.DeviceCapability) *libei.Device {
+	if dev, ok := f.devices[cap]; ok {
+		return dev
+	}
+	return nil
+}
+func (f *LibEIInput) MouseMoveRel(dx, dy int16) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := f.getDevice(libei.DeviceCapPointer)
+	if dev == nil {
+		return
+	}
+
+	dev.PointerMotion(float64(dx), float64(dy))
+	dev.Frame(uint64(f.client.Now()))
+}
+
+func (f *LibEIInput) MouseMoveAbs(dx, dy int16) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := f.getDevice(libei.DeviceCapPointerAbsolute)
+
+	dev.PointerMotionAbsolute(float64(dx), float64(dy))
+	dev.Frame(uint64(f.client.Now()))
+}
+
+func (f *LibEIInput) MouseButtonMapped(btn uint8, btnmap MouseButtonMap, isUp int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := f.getDevice(libei.DeviceCapButton)
+	var button uint32
+	switch btn {
+	case uint8(btnmap.Left):
+		button = libei.ButtonLeft
+	case uint8(btnmap.Right):
+		button = libei.ButtonRight
+	case uint8(btnmap.Middle):
+		button = libei.ButtonMiddle
+	case uint8(btnmap.Forward):
+		button = libei.ButtonForward
+	case uint8(btnmap.Back):
+		button = libei.ButtonBack
+
+	default:
+		fmt.Printf("mouse button %d is not supported", btn)
+	}
+	dev.Button(button, isUp == 0)
+	dev.Frame(uint64(f.client.Now()))
+}
+
+func (f *LibEIInput) KeyDown(ki keyinfo) {
+	f.sendKey(ki, true)
+	if ki.modif == MODIF_AUTO_RELEASE {
+		f.sendKey(ki, false)
+	}
+}
+
+func (f *LibEIInput) KeyUp(ki keyinfo) {
+	f.sendKey(ki, false)
+}
+
+func (f *LibEIInput) sendKey(ki keyinfo, pressed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := f.getDevice(libei.DeviceCapKeyboard)
+	if dev == nil {
+		return
+	}
+
+	dev.KeyboardKey(uint32(ki.kc)-8, pressed)
+	dev.Frame(uint64(f.client.Now()))
+}
+
+func (f *LibEIInput) Wheel(delta int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	dev := f.getDevice(libei.DeviceCapScroll)
+
+	dev.ScrollDelta(0, float64(delta/12))
+	dev.Frame(uint64(f.client.Now()))
+}
+
+func (f *LibEIInput) Close() {
+	f.session.Close()
 }

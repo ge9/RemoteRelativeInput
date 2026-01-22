@@ -19,7 +19,7 @@ var X11Keys = map[string]uint32{
 	"VK_OEM_1":      0x003a, // ";:" in US,  ":*" in JP (colon works for both)
 	"VK_OEM_COMMA":  0x002c,
 	"VK_OEM_MINUS":  0x002d,
-	"VK_OEM_7":      0x0027, // "'"" in US, "^~" in JP
+	"VK_OEM_7":      0x0027, // "'"" in US, "^~" in JP (keymap override required)
 	"VK_OEM_PERIOD": 0x002e,
 	"VK_OEM_2":      0x002f, // "/?" in US and JP
 	"VK_OEM_5":      0x007c, // "\|" in US and JP.

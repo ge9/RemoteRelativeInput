@@ -1,6 +1,6 @@
 module github.com/TKMAX777/RemoteRelativeInput
 
-go 1.18
+go 1.24.4
 
 require (
 	github.com/go-ole/go-ole v1.2.6
@@ -9,6 +9,8 @@ require (
 	github.com/pkg/errors v0.9.1
 	golang.org/x/sys v0.29.0
 )
+
+require github.com/bnema/libei-go-bindings v0.1.0 // indirect
 
 require (
 	github.com/MatthiasKunnen/go-wayland/wayland v0.2.0

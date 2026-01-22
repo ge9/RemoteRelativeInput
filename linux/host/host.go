@@ -28,34 +28,29 @@ func StartServer() {
 
 	var (
 		clientLinux        bool
-		shiftOnlyFlag      string
 		autoReleaseFlag    string
 		keymapOverrideFlag string
 	)
 
 	flag.BoolVar(&clientLinux, "linux", false,
 		"the client is Linux")
-	flag.StringVar(&shiftOnlyFlag, "shiftonly", "",
-		"comma-separated uint32 keycodes (e.g. 0x007c,111)")
 	flag.StringVar(&autoReleaseFlag, "autorelease", "",
 		"comma-separated uint32 keycodes (e.g. 0xff2a,222)")
 	flag.StringVar(&keymapOverrideFlag, "keymap-override", "",
 		"comma-separated key mappings uint8:uint32 (e.g. 0xDE:0x005e,111:222)")
 
 	flag.Parse()
-	shiftOnlyKeys := parseUint32List(shiftOnlyFlag)
 	autoReleaseKeys := parseUint32List(autoReleaseFlag)
 	keymap_override := parseKeymapOverride(keymapOverrideFlag)
 
-	fmt.Printf("shiftOnlyKeys = %#v\n", shiftOnlyKeys)
 	fmt.Printf("autoReleaseKeys = %#v\n", autoReleaseKeys)
 	fmt.Printf("keymap_override = %#v\n", keymap_override)
 	mbm := MouseButtonMap{
 		1, 3, 2, 9, 8,
 	}
-	result := getKeyMapLinux(X, shiftOnlyKeys, keymap_override)
+	result := getKeyMapLinux(X, autoReleaseKeys, keymap_override)
 	if !clientLinux { //Windows
-		result = getKeyMapWin(X, shiftOnlyKeys, autoReleaseKeys, keymap_override)
+		result = getKeyMapWin(X, autoReleaseKeys, keymap_override)
 		mbm = MouseButtonMap{
 			1, 2, 4, 8, 16,
 		}
@@ -139,7 +134,7 @@ func getModifMap(X *xgb.Conn) map[uint32]uint32 {
 	}
 	return modif_map
 }
-func getKeyMapWin(X *xgb.Conn, shiftOnlyKeys []uint32, autoReleaseKeys []uint32, keymap_override map[uint8]uint32) map[uint8]keyinfo {
+func getKeyMapWin(X *xgb.Conn, autoReleaseKeys []uint32, keymap_override map[uint8]uint32) map[uint8]keyinfo {
 	setup := xproto.Setup(X)
 	min := uint32(setup.MinKeycode)
 	max := uint32(setup.MaxKeycode)
@@ -170,25 +165,32 @@ func getKeyMapWin(X *xgb.Conn, shiftOnlyKeys []uint32, autoReleaseKeys []uint32,
 			}
 			keysym = keysym0
 		}
-
-		for kc := min; kc < max; kc++ {
-			base := int(kc-min) * keysymsPerKeycode
-			for i := 0; i < keysymsPerKeycode; i++ {
-				if slices.Contains(shiftOnlyKeys, keysym) && i >= 2 {
-					continue
-				}
-				if uint32(reply.Keysyms[base+i]) == keysym {
-					if slices.Contains(autoReleaseKeys, keysym) {
-						result[winKC] = keyinfo{kc, MODIF_AUTO_RELEASE}
-					} else {
-						modbit := modif_map[kc] //0 if not a modifier
-						result[winKC] = keyinfo{kc, modbit}
+		var getKeySymWithMax = func(maxI int) keyinfo {
+			for kc := min; kc < max; kc++ {
+				base := int(kc-min) * keysymsPerKeycode
+				for i := 0; i < keysymsPerKeycode; i++ {
+					if maxI != 0 && i >= maxI {
+						continue
 					}
-					goto found
+					if uint32(reply.Keysyms[base+i]) == keysym {
+						if slices.Contains(autoReleaseKeys, keysym) {
+							return keyinfo{kc, MODIF_AUTO_RELEASE}
+						} else {
+							modbit := modif_map[kc] //0 if not a modifier
+							return keyinfo{kc, modbit}
+						}
+					}
 				}
 			}
+			return keyinfo{}
 		}
-	found:
+		//We first use only index 0 (no modifier) and 1 (shift). Above 2 are AltGr keys or "Group2" keys etc.
+		//This is a bit heuristic, but will work in most cases.
+		ki := getKeySymWithMax(2)
+		if (ki == keyinfo{}) { //nil
+			getKeySymWithMax(0)
+		}
+		result[winKC] = ki
 	}
 	return result
 }
